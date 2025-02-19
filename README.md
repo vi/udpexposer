@@ -50,7 +50,7 @@ Download a pre-built executable from [Github releases](https://github.com/vi/udp
 ### Glossary
 
 * Server - instance of Udpexposer that is running on Helper Host (which has unfirewalled internet connection).
-* Client - instance of Udpedposer that is running on a host behind a firewall (which does not typically allow new incoming UDP connections, but allows outgoing UDP connections as long as some traffic remains).
+* Client - instance of Udpexposer that is running on a host behind a firewall (which does not typically allow new incoming UDP connections, but allows outgoing UDP connections as long as some traffic remains).
 * RealServer - some UDP application (e.g. Wireguard) that expects datagrams from one or multiple clients and would reply back to seen addresses. Located in the same network as Client.
 * Connectee - client of a RealServer that interacts with a Server thinking it is a RealServer. Is expected to be behind a firewall, not int the same network as RealServer.
 
