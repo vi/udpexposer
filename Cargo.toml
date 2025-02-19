@@ -1,7 +1,13 @@
 [package]
 name = "udpexposer"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+repository = "https://github.com/vi/udpexposer"
+license = "MIT OR Apache-2.0"
+description = "Command line tool to help exposing UDP ports behind NATs using helper servers"
+categories = ["network-programming", "command-line-utilities"]
+keywords = ["udp", "nat"]
+
 
 [dependencies]
 anyhow = "1.0.95"

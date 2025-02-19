@@ -5,7 +5,7 @@ use argh::FromArgs;
 use tokio::sync::mpsc::Sender;
 
 #[derive(FromArgs)]
-/// Reach new heights.
+/// Expose UDP port externally using helper hosts
 struct Args {
     /// UDP socket address to bind to
     #[argh(positional)]
@@ -210,7 +210,7 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                     }
                                     Outcome2::FromSocket(Err(e)) => {
-                                        println!("Error receiving from worder socket: {e}");
+                                        println!("Error receiving from worker socket: {e}");
                                     }
                                     Outcome2::FromSocket(Ok((n,from))) => {
                                         if from != local_connect_addr {
