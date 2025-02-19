@@ -34,11 +34,12 @@ Legend: `$` - command line, `>` terminal output, `<` - terminal input, `#` - com
 ## Security
 
 1. The tool assumes that traffic is already secured (e.g. a Wireguard connection). There is no encryption or authentication.
-2. The tool is not DoS-resistant. Hostile peers can redirect to themselves just by sending an empty datagram. Sending any datagrams from too many source addresses also deprives real Connectees from the service.
-3. The tool may amplify DDoS attack, as a single UDP datagram with a spoofed source address may trigger significant reply traffic.
+2. The tool is not DoS-resistant. Sending any datagrams from too many source addresses also deprives real Connectees from the service. Without `--password`, empty datagrams also distrupt all the clients.
+3. Unless `--password` is used, the tool may amplify DDoS attacks, as a single UDP datagram with a spoofed source address may trigger significant reply traffic.
 4. On client, worker UDP sockets may be too permissive and allow extra unintended traffic.
+5. `--password` mode is an unaudited security code.
 
-Due to the third point, it is not recommended to run this as a permanent, long-term setup, especially use it to expose widely known endpoints with significant traffic.
+It is not recommended to run this as a permanent, long-term setup, especially use it to expose widely known / high traffic endpoints, especially without `--password`.
 
 
 ## Installation
@@ -53,6 +54,7 @@ Download a pre-built executable from [Github releases](https://github.com/vi/udp
 * Client - instance of Udpexposer that is running on a host behind a firewall (which does not typically allow new incoming UDP connections, but allows outgoing UDP connections as long as some traffic remains).
 * RealServer - some UDP application (e.g. Wireguard) that expects datagrams from one or multiple clients and would reply back to seen addresses. Located in the same network as Client.
 * Connectee - client of a RealServer that interacts with a Server thinking it is a RealServer. Is expected to be behind a firewall, not int the same network as RealServer.
+* Keepalive - message periodically sent from Client to Server to keep NAT assoication open and to make server aware of current Client's external address.
 
 ### Server mode
 
@@ -60,14 +62,14 @@ Download a pre-built executable from [Github releases](https://github.com/vi/udp
 2. Allocate LRU map between tags and socket addresses. It has a static number of available slots, which is maximum client count.
 3. Designate an initially empty slot for one Client socket address.
 4. Wait for incoming datagrams. For each incoming datagram:
-5. Check if is has zero-length payload. If it is, it is a Client Keepalive and updates Client socket address in "3.".
+5. Check if is a keepalive message. Without `--password`, it is any zero-length UDP datagram. If it is a keepalive, Client socket address in "3." is updated.
 6. Check if it is coming from the Client (using address stored in "3."). If it is, take tag from the first two bytes of the payload and lookup Connectee address in "2.". Send the payload to that address.
 7. If it is not coming from Client and not empty then it is coming from Connectee. Register the source socket address in "2." (possibly evicting an old entry), assign a tag to it and send the datagram to Client (if its address in "3." is already known), prepending a Connectee tag.
 
 ## Client mode
 
 1. Create and bind UDP socket for communication with Server.
-2. Start sending empty keepalive UDP datagrams to Server address.
+2. Start sending keepalive UDP datagrams to Server address.
 3. Allocate LRU map between two-byte tags and local UDP sockets. It has static, predefined number of slots, which should match the one configured on server.
 4. For each incoming UDP datagram on the main socket, extract the tag from payload and lookup appropriate local (worker) UDP socket. If not found, bind a new one to random port and use it for communicating with a RealServer. This may evict (close) some old worker soocket. Send payload from the looked up (or just creted) worker socket to RealServer.
 5. For each incoming UDP datagram on the worker socket, tag with with client number and send to Server.
@@ -78,9 +80,9 @@ Download a pre-built executable from [Github releases](https://github.com/vi/udp
 <details><summary> udpexposer --help output</summary>
 
 ```
-Usage: udpexposer <listen_addr> [-c <local-connect-addr>] [-a <server-addr>] [-s] [-n <max-clients>] [-i <ping-interval-ms>]
+Usage: udpexposer <listen_addr> [-c <local-connect-addr>] [-a <server-addr>] [-s] [-n <max-clients>] [-i <ping-interval-ms>] [-P <password>]
 
-Expose UDP port externally using helper hosts.
+Expose UDP port externally using helper hosts
 
 Positional Arguments:
   listen_addr       UDP socket address to bind to
@@ -93,6 +95,9 @@ Options:
   -n, --max-clients maximum number of clients (LRU-style)
   -i, --ping-interval-ms
                     for client mode, keepalive interval
+  -P, --password    pre-shared key / password to protect server against
+                    unsolicited clients
   --help, help      display usage information
+
 ```
 </details>
