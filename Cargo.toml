@@ -12,5 +12,15 @@ keywords = ["udp", "nat"]
 [dependencies]
 anyhow = "1.0.95"
 argh = "0.1.13"
+hmac = { version = "0.12.1", optional = true, features = ["std"] }
+jwt = { version = "0.16.0", optional = true }
 lru = "0.12.5"
+rust-argon2 = { version = "2.1.0", optional = true }
+serde = { version = "1.0.217", optional = true }
+serde_derive = { version = "1.0.217", optional = true }
+sha2 = { version = "0.10.8", optional = true }
 tokio = { version = "1.42.0", features = ["net", "rt", "macros", "time", "io-util", "sync"] }
+
+[features]
+default = ["signed_keepalives"]
+signed_keepalives = ["dep:jwt", "dep:hmac", "dep:sha2", "dep:serde", "dep:serde_derive", "dep:rust-argon2"]

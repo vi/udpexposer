@@ -30,6 +30,132 @@ struct Args {
     /// for client mode, keepalive interval
     #[argh(option, short = 'i', default = "25000")]
     ping_interval_ms: u64,
+
+    /// pre-shared key / password to protect server against unsolicited clients
+    #[argh(option, short = 'P')]
+    password: Option<String>,
+}
+
+#[cfg(feature = "signed_keepalives")]
+mod signed_keepalives {
+    use hmac::{Hmac, Mac};
+    use jwt::{SignWithKey, VerifyWithKey};
+    use sha2::Sha256;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const TOKEN_VALIDITY_SECONDS_PAST: u64 = 10;
+    const TOKEN_VALIDITY_SECONDS_FUTURE: u64 = 1;
+
+    #[derive(Debug, serde_derive::Deserialize, serde_derive::Serialize)]
+    pub struct Request {
+        pub nonce: Option<u64>,
+    }
+
+    #[derive(Debug, serde_derive::Deserialize, serde_derive::Serialize)]
+    pub enum Reply {
+        Registered,
+        Retry(u64),
+    }
+
+    pub struct SecureKeepalives {
+        key: Hmac<Sha256>,
+    }
+
+    pub enum ServerVerificationResult {
+        Invalid,
+        NeedsRetry(Vec<u8>),
+        Accepted(Vec<u8>),
+    }
+
+    pub enum ClientVerificationResult {
+        Invalid,
+        Resend(Vec<u8>),
+        Ok,
+    }
+
+    pub const AUTH_SIGNATURE: &[u8] = b"eyJhbGciOiJIUzI1NiJ9.";
+
+    impl SecureKeepalives {
+        pub fn new(password: &str) -> Self {
+            let password = password.as_bytes();
+            let salt = b"udpexposer";
+            let config = argon2::Config {
+                variant: argon2::Variant::Argon2i,
+                version: argon2::Version::Version13,
+                mem_cost: 256,
+                time_cost: 2,
+                lanes: 2,
+                secret: &[],
+                ad: &[],
+                hash_length: 32,
+            };
+            let hash = argon2::hash_raw(password, salt, &config).unwrap();
+
+            let key: Hmac<Sha256> = Hmac::new_from_slice(&hash).unwrap();
+            SecureKeepalives { key }
+        }
+
+        pub fn sign(&self, msg: &impl serde::Serialize) -> String {
+            msg.sign_with_key(&self.key).unwrap()
+        }
+
+        pub fn verify<T: for<'de> serde::Deserialize<'de>>(&self, msg: &[u8]) -> Option<T> {
+            let Ok(msg) = std::str::from_utf8(msg) else {
+                return None;
+            };
+            let Ok(ret): Result<T, _> = msg.verify_with_key(&self.key) else {
+                return None;
+            };
+            Some(ret)
+        }
+
+        pub fn verify_request(&self, msg: &[u8], lax_mode: bool) -> ServerVerificationResult {
+            let time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let time_low = time.saturating_sub(TOKEN_VALIDITY_SECONDS_PAST);
+            let time_high = time.saturating_add(TOKEN_VALIDITY_SECONDS_FUTURE);
+
+            let Some(msg): Option<Request> = self.verify(msg) else {
+                return ServerVerificationResult::Invalid;
+            };
+
+            let accepted = lax_mode
+                || if let Some(nonce) = msg.nonce {
+                    if nonce >= time_low && nonce <= time_high {
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+            if accepted {
+                ServerVerificationResult::Accepted(self.sign(&Reply::Registered).into_bytes())
+            } else {
+                ServerVerificationResult::NeedsRetry(self.sign(&Reply::Retry(time)).into_bytes())
+            }
+        }
+
+        pub fn process_reply(&self, msg: &[u8]) -> ClientVerificationResult {
+            let Some(msg): Option<Reply> = self.verify(msg) else {
+                return ClientVerificationResult::Invalid;
+            };
+
+            match msg {
+                Reply::Registered => ClientVerificationResult::Ok,
+                Reply::Retry(x) => ClientVerificationResult::Resend(
+                    self.sign(&Request { nonce: Some(x) }).into_bytes(),
+                ),
+            }
+        }
+
+        pub fn initial_client_request(&self) -> Vec<u8> {
+            self.sign(&Request { nonce: None }).into_bytes()
+        }
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -41,7 +167,16 @@ async fn main() -> anyhow::Result<()> {
         server_mode,
         max_clients,
         ping_interval_ms,
+        password,
     } = argh::from_env();
+
+    #[cfg(not(feature = "signed_keepalives"))]
+    if password.is_some() {
+        anyhow::bail!("--password support is not enabled at build time")
+    }
+
+    #[cfg(feature = "signed_keepalives")]
+    let signer = password.map(|x| signed_keepalives::SecureKeepalives::new(&x));
 
     let main_socket = tokio::net::UdpSocket::bind(listen_addr).await?;
     let mut buf = [0u8; 2048];
@@ -61,7 +196,43 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             };
 
-            if n == 0 {
+            let mut is_keepalive = n == 0;
+
+            #[cfg(feature = "signed_keepalives")]
+            if let Some(ref s) = signer {
+                is_keepalive = false;
+                let msg = &buf[2..][..n];
+                if msg.starts_with(signed_keepalives::AUTH_SIGNATURE) {
+                    if client_address == Some(from) {
+                        //
+                    }
+                    match s.verify_request(msg, Some(from) == client_address) {
+                        signed_keepalives::ServerVerificationResult::Invalid => {}
+                        signed_keepalives::ServerVerificationResult::NeedsRetry(reply) => {
+                            println!("Authenticating: {from}");
+                            if main_socket.send_to(&reply, from).await.is_err() {
+                                println!("Error sending to the main socket to preauth client");
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                            continue;
+                        }
+                        signed_keepalives::ServerVerificationResult::Accepted(reply) => {
+                            if client_address != Some(from) {
+                                println!("New client address: {from}");
+                                client_address = Some(from)
+                            }
+
+                            if main_socket.send_to(&reply, from).await.is_err() {
+                                println!("Error sending to the main socket to preauth client");
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if is_keepalive {
                 if client_address != Some(from) {
                     println!("New client address: {from}");
                     client_address = Some(from)
@@ -84,8 +255,8 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 };
 
-                if main_socket.send_to(&buf[4..(n+2)], addr).await.is_err() {
-                    println!("Error sending to the main socket to client");
+                if main_socket.send_to(&buf[4..(n + 2)], addr).await.is_err() {
+                    println!("Error sending to the main socket to connectee");
                     tokio::time::sleep(Duration::from_millis(5)).await;
                     continue;
                 }
@@ -107,7 +278,7 @@ async fn main() -> anyhow::Result<()> {
                     .await
                     .is_err()
                 {
-                    println!("Error sending to the main socket to connectee");
+                    println!("Error sending to the main socket to client");
                     tokio::time::sleep(Duration::from_millis(5)).await;
                     continue;
                 }
@@ -141,6 +312,9 @@ async fn main() -> anyhow::Result<()> {
             //FromActor(Option<DatagramFromLocal>),
         }
 
+        #[cfg(feature = "signed_keepalives")]
+        let mut announced_registration = false;
+
         loop {
             let ret: Outcome = tokio::select! {
                 biased;
@@ -158,7 +332,14 @@ async fn main() -> anyhow::Result<()> {
 
             match ret {
                 Outcome::Tick => {
-                    if main_socket.send_to(b"", server_addr).await.is_err() {
+                    let mut msg: &[u8] = b"";
+                    let msg_buf: Vec<u8>;
+                    #[cfg(feature = "signed_keepalives")]
+                    if let Some(ref s) = signer {
+                        msg_buf = s.initial_client_request();
+                        msg = &msg_buf;
+                    }
+                    if main_socket.send_to(msg, server_addr).await.is_err() {
                         println!("Failed to send a keepalive to server address");
                     }
                 }
@@ -169,8 +350,34 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Outcome::FromMainSocket(Ok((n, _from))) => {
                     if n <= 2 {
-                        println!("Datafram from server too small");
+                        println!("Datagram from server is too small");
                         continue;
+                    }
+
+                    #[cfg(feature = "signed_keepalives")]
+                    if let Some(ref s) = signer {
+                        if buf.starts_with(signed_keepalives::AUTH_SIGNATURE) {
+                            match s.process_reply(&buf[0..n]) {
+                                signed_keepalives::ClientVerificationResult::Invalid => {}
+                                signed_keepalives::ClientVerificationResult::Resend(vec) => {
+                                    if main_socket.send_to(&vec, server_addr).await.is_err() {
+                                        println!("Failed to send a keepalive to server address");
+                                    } else {
+                                        if !announced_registration {
+                                            println!("Received a reply from server");
+                                        }
+                                    }
+                                    continue;
+                                }
+                                signed_keepalives::ClientVerificationResult::Ok => {
+                                    if !announced_registration {
+                                        println!("Authenticated");
+                                        announced_registration = true;
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                     }
 
                     let channel_id: [u8; 2] = buf[0..2].try_into().unwrap();
@@ -212,15 +419,21 @@ async fn main() -> anyhow::Result<()> {
                                     Outcome2::FromSocket(Err(e)) => {
                                         println!("Error receiving from worker socket: {e}");
                                     }
-                                    Outcome2::FromSocket(Ok((n,from))) => {
+                                    Outcome2::FromSocket(Ok((n, from))) => {
                                         if from != local_connect_addr {
-                                            println!("Foreign incoming address on worker socket: {from}");
+                                            println!(
+                                                "Foreign incoming address on worker socket: {from}"
+                                            );
                                             continue;
                                         }
 
                                         buf2[0..2].copy_from_slice(&channel_id.to_be_bytes());
 
-                                        if main_socket.send_to(&buf2[0..(n+2)], server_addr).await.is_err() {
+                                        if main_socket
+                                            .send_to(&buf2[0..(n + 2)], server_addr)
+                                            .await
+                                            .is_err()
+                                        {
                                             println!("Error sending to server addr {server_addr}");
                                         }
                                     }
