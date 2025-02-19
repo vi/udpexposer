@@ -38,7 +38,7 @@ Legend: `$` - command line, `>` terminal output, `<` - terminal input, `#` - com
 3. The tool may amplify DDoS attack, as a single UDP datagram with a spoofed source address may trigger significant reply traffic.
 4. On client, worker UDP sockets may be too permissive and allow extra unintended traffic.
 
-Due to the third point, it is not recommended to run this as a permanent, long-term setup, especially use it to expose widely known services.
+Due to the third point, it is not recommended to run this as a permanent, long-term setup, especially use it to expose widely known endpoints with significant traffic.
 
 
 ## Installation
