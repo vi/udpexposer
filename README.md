@@ -36,8 +36,7 @@ Legend: `$` - command line, `>` terminal output, `<` - terminal input, `#` - com
 1. The tool assumes that traffic is already secured (e.g. a Wireguard connection). There is no encryption or authentication.
 2. The tool is not DoS-resistant. Sending any datagrams from too many source addresses also deprives real Connectees from the service. Without `--password`, empty datagrams also distrupt all the clients.
 3. Unless `--password` is used, the tool may amplify DDoS attacks, as a single UDP datagram with a spoofed source address may trigger significant reply traffic.
-4. On client, worker UDP sockets may be too permissive and allow extra unintended traffic.
-5. `--password` mode is an unaudited security code.
+4. `--password` mode is an unaudited security code.
 
 It is not recommended to run this as a permanent, long-term setup, especially use it to expose widely known / high traffic endpoints, especially without `--password`.
 

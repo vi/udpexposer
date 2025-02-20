@@ -41,6 +41,8 @@ mod signed_keepalives {
     use hmac::{Hmac, Mac};
     use jwt::{SignWithKey, VerifyWithKey};
     use sha2::Sha256;
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    use std::net::SocketAddr;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const TOKEN_VALIDITY_SECONDS_PAST: u64 = 10;
@@ -59,6 +61,7 @@ mod signed_keepalives {
 
     pub struct SecureKeepalives {
         key: Hmac<Sha256>,
+        hasher: DefaultHasher,
     }
 
     pub enum ServerVerificationResult {
@@ -92,7 +95,10 @@ mod signed_keepalives {
             let hash = argon2::hash_raw(password, salt, &config).unwrap();
 
             let key: Hmac<Sha256> = Hmac::new_from_slice(&hash).unwrap();
-            SecureKeepalives { key }
+            SecureKeepalives {
+                key,
+                hasher: Default::default(),
+            }
         }
 
         pub fn sign(&self, msg: &impl serde::Serialize) -> String {
@@ -109,7 +115,7 @@ mod signed_keepalives {
             Some(ret)
         }
 
-        pub fn verify_request(&self, msg: &[u8], lax_mode: bool) -> ServerVerificationResult {
+        pub fn verify_request(&self, msg: &[u8], lax_mode: bool, from: SocketAddr) -> ServerVerificationResult {
             let time = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -117,12 +123,19 @@ mod signed_keepalives {
             let time_low = time.saturating_sub(TOKEN_VALIDITY_SECONDS_PAST);
             let time_high = time.saturating_add(TOKEN_VALIDITY_SECONDS_FUTURE);
 
+
             let Some(msg): Option<Request> = self.verify(msg) else {
                 return ServerVerificationResult::Invalid;
             };
 
+            let nonce = msg.nonce;
+            let mut h = self.hasher.clone();
+            from.hash(&mut h);
+            let addr_hash = h.finish();
+
             let accepted = lax_mode
-                || if let Some(nonce) = msg.nonce {
+                || if let Some(mut nonce) = nonce {
+                    nonce ^= addr_hash;
                     if nonce >= time_low && nonce <= time_high {
                         true
                     } else {
@@ -135,7 +148,7 @@ mod signed_keepalives {
             if accepted {
                 ServerVerificationResult::Accepted(self.sign(&Reply::Registered).into_bytes())
             } else {
-                ServerVerificationResult::NeedsRetry(self.sign(&Reply::Retry(time)).into_bytes())
+                ServerVerificationResult::NeedsRetry(self.sign(&Reply::Retry(time ^ addr_hash)).into_bytes())
             }
         }
 
@@ -188,6 +201,9 @@ async fn main() -> anyhow::Result<()> {
         let mut lru = lru::LruCache::<SocketAddr, u16>::new(
             std::num::NonZeroUsize::new(max_clients).unwrap(),
         );
+        let mut lru_rev = lru::LruCache::<u16, SocketAddr>::new(
+            std::num::NonZeroUsize::new(max_clients).unwrap(),
+        );
 
         loop {
             let Ok((n, from)) = main_socket.recv_from(&mut buf[2..]).await else {
@@ -198,6 +214,8 @@ async fn main() -> anyhow::Result<()> {
 
             let mut is_keepalive = n == 0;
 
+            let mut inhibit_wrong_channel_message = false;
+
             #[cfg(feature = "signed_keepalives")]
             if let Some(ref s) = signer {
                 is_keepalive = false;
@@ -206,8 +224,11 @@ async fn main() -> anyhow::Result<()> {
                     if client_address == Some(from) {
                         //
                     }
-                    match s.verify_request(msg, Some(from) == client_address) {
-                        signed_keepalives::ServerVerificationResult::Invalid => {}
+                    match s.verify_request(msg, Some(from) == client_address, from) {
+                        signed_keepalives::ServerVerificationResult::Invalid => {
+                            println!("A client from {from} failed to authenticate");
+                            inhibit_wrong_channel_message = true;
+                        }
                         signed_keepalives::ServerVerificationResult::NeedsRetry(reply) => {
                             println!("Authenticating: {from}");
                             if main_socket.send_to(&reply, from).await.is_err() {
@@ -249,9 +270,10 @@ async fn main() -> anyhow::Result<()> {
                 let channel_id: [u8; 2] = buf[2..4].try_into().unwrap();
                 let channel_id = u16::from_be_bytes(channel_id);
 
-                // FIXME: inefficient iteration
-                let Some((&addr, _)) = lru.iter().find(|(_, v)| **v == channel_id) else {
-                    println!("Failed to find channel {channel_id}");
+                let Some(&addr) = lru_rev.peek(&channel_id) else {
+                    if !inhibit_wrong_channel_message {
+                        println!("Failed to find channel {channel_id}");
+                    }
                     continue;
                 };
 
@@ -268,6 +290,9 @@ async fn main() -> anyhow::Result<()> {
                 let &channel_id = lru.get_or_insert(from, || {
                     seqn += 1;
                     println!("Connectee seqn {seqn} from {from}");
+
+                    lru_rev.push(seqn, from);
+
                     seqn
                 });
 
