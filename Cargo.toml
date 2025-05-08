@@ -20,7 +20,11 @@ serde = { version = "1.0.217", optional = true }
 serde_derive = { version = "1.0.217", optional = true }
 sha2 = { version = "0.10.8", optional = true }
 tokio = { version = "1.42.0", features = ["net", "rt", "macros", "time", "io-util", "sync"] }
+bincode = {version = "2.0.1", optional=true}
+serde_json = {version = "1", optional=true}
 
 [features]
-default = ["signed_keepalives"]
+default = ["signed_keepalives", "stats", "stats_display"]
 signed_keepalives = ["dep:jwt", "dep:hmac", "dep:sha2", "dep:serde", "dep:serde_derive", "dep:rust-argon2"]
+stats = ["dep:bincode"]
+stats_display = ["dep:bincode", "dep:serde_derive", "dep:serde_json"]

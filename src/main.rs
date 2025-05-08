@@ -34,6 +34,49 @@ struct Args {
     /// pre-shared key / password to protect server against unsolicited clients
     #[argh(option, short = 'P')]
     password: Option<String>,
+
+    /// inserad of operating as a client or server, obtain a stats block from a given server and dump it as JSON to stdout
+    #[argh(switch, short = 'S')]
+    dump_stats: bool,
+}
+
+#[derive(Default)]
+#[cfg_attr(feature = "stats", derive(bincode::Encode))]
+#[cfg_attr(
+    feature = "stats_display",
+    derive(serde_derive::Serialize, bincode::Decode)
+)]
+struct Stats {
+    err1: u64,
+    signed_looking: u64,
+    refresh_address: u64,
+    invalid_auths: u64,
+    auth_in_progress: u64,
+    auth_completeds: u64,
+    err2: u64,
+    simple_keepalives: u64,
+    simple_address_switches: u64,
+    dwarfs: u64,
+    ch_not_founds: u64,
+    err3: u64,
+    dropped_no_client_address: u64,
+    new_connectees: u64,
+    err4: u64,
+    from_connectee_bytes: u64,
+    from_connectee_msgs: u64,
+    from_client_bytes: u64,
+    from_client_msgs: u64,
+    stats_requests: u64,
+    last_ka_s: u64,
+    last_client_s: u64,
+    last_connectee_s: u64,
+}
+
+fn get_unixtime() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 #[cfg(feature = "signed_keepalives")]
@@ -43,10 +86,11 @@ mod signed_keepalives {
     use sha2::Sha256;
     use std::hash::{DefaultHasher, Hash, Hasher};
     use std::net::SocketAddr;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     const TOKEN_VALIDITY_SECONDS_PAST: u64 = 10;
     const TOKEN_VALIDITY_SECONDS_FUTURE: u64 = 1;
+
+    const SPECIAL_NONCE_FOR_STATS: u64 = u64::MAX;
 
     #[derive(Debug, serde_derive::Deserialize, serde_derive::Serialize)]
     pub struct Request {
@@ -68,6 +112,7 @@ mod signed_keepalives {
         Invalid,
         NeedsRetry(Vec<u8>),
         Accepted(Vec<u8>),
+        StatsRequest,
     }
 
     pub enum ClientVerificationResult {
@@ -115,18 +160,23 @@ mod signed_keepalives {
             Some(ret)
         }
 
-        pub fn verify_request(&self, msg: &[u8], lax_mode: bool, from: SocketAddr) -> ServerVerificationResult {
-            let time = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+        pub fn verify_request(
+            &self,
+            msg: &[u8],
+            lax_mode: bool,
+            from: SocketAddr,
+        ) -> ServerVerificationResult {
+            let time = crate::get_unixtime();
             let time_low = time.saturating_sub(TOKEN_VALIDITY_SECONDS_PAST);
             let time_high = time.saturating_add(TOKEN_VALIDITY_SECONDS_FUTURE);
-
 
             let Some(msg): Option<Request> = self.verify(msg) else {
                 return ServerVerificationResult::Invalid;
             };
+
+            if msg.nonce == Some(SPECIAL_NONCE_FOR_STATS) {
+                return ServerVerificationResult::StatsRequest;
+            }
 
             let nonce = msg.nonce;
             let mut h = self.hasher.clone();
@@ -148,7 +198,9 @@ mod signed_keepalives {
             if accepted {
                 ServerVerificationResult::Accepted(self.sign(&Reply::Registered).into_bytes())
             } else {
-                ServerVerificationResult::NeedsRetry(self.sign(&Reply::Retry(time ^ addr_hash)).into_bytes())
+                ServerVerificationResult::NeedsRetry(
+                    self.sign(&Reply::Retry(time ^ addr_hash)).into_bytes(),
+                )
             }
         }
 
@@ -168,6 +220,13 @@ mod signed_keepalives {
         pub fn initial_client_request(&self) -> Vec<u8> {
             self.sign(&Request { nonce: None }).into_bytes()
         }
+
+        pub fn stats_request(&self) -> Vec<u8> {
+            self.sign(&Request {
+                nonce: Some(SPECIAL_NONCE_FOR_STATS),
+            })
+            .into_bytes()
+        }
     }
 }
 
@@ -181,11 +240,24 @@ async fn main() -> anyhow::Result<()> {
         max_clients,
         ping_interval_ms,
         password,
+        dump_stats,
     } = argh::from_env();
 
     #[cfg(not(feature = "signed_keepalives"))]
     if password.is_some() {
         anyhow::bail!("--password support is not enabled at build time")
+    }
+
+    #[cfg(not(feature = "stats_display"))]
+    if dump_stats {
+        anyhow::bail!("--dump-stats support is not enabled at build time")
+    }
+
+    if dump_stats && password.is_none() {
+        anyhow::bail!("--dump-stats does not work without --password")
+    }
+    if dump_stats && server_addr.is_none() {
+        anyhow::bail!("--dump-stats does not work without --server-addr")
     }
 
     #[cfg(feature = "signed_keepalives")]
@@ -195,6 +267,7 @@ async fn main() -> anyhow::Result<()> {
     let mut buf = [0u8; 2048];
 
     if server_mode {
+        let mut stats = Stats::default();
         let mut client_address: Option<SocketAddr> = None;
 
         let mut seqn: u16 = 0;
@@ -207,6 +280,7 @@ async fn main() -> anyhow::Result<()> {
 
         loop {
             let Ok((n, from)) = main_socket.recv_from(&mut buf[2..]).await else {
+                stats.err1 += 1;
                 println!("Error receiving from the main socket");
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 continue;
@@ -221,15 +295,19 @@ async fn main() -> anyhow::Result<()> {
                 is_keepalive = false;
                 let msg = &buf[2..][..n];
                 if msg.starts_with(signed_keepalives::AUTH_SIGNATURE) {
+                    stats.signed_looking += 1;
                     if client_address == Some(from) {
-                        //
+                        stats.last_ka_s = get_unixtime();
+                        stats.refresh_address += 1;
                     }
                     match s.verify_request(msg, Some(from) == client_address, from) {
                         signed_keepalives::ServerVerificationResult::Invalid => {
+                            stats.invalid_auths += 1;
                             println!("A client from {from} failed to authenticate");
                             inhibit_wrong_channel_message = true;
                         }
                         signed_keepalives::ServerVerificationResult::NeedsRetry(reply) => {
+                            stats.auth_in_progress += 1;
                             println!("Authenticating: {from}");
                             if main_socket.send_to(&reply, from).await.is_err() {
                                 println!("Error sending to the main socket to preauth client");
@@ -238,14 +316,33 @@ async fn main() -> anyhow::Result<()> {
                             continue;
                         }
                         signed_keepalives::ServerVerificationResult::Accepted(reply) => {
+                            stats.auth_completeds += 1;
+                            stats.last_ka_s = get_unixtime();
                             if client_address != Some(from) {
                                 println!("New client address: {from}");
                                 client_address = Some(from)
                             }
 
                             if main_socket.send_to(&reply, from).await.is_err() {
+                                stats.err2 += 1;
                                 println!("Error sending to the main socket to preauth client");
                                 tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                            continue;
+                        }
+                        signed_keepalives::ServerVerificationResult::StatsRequest => {
+                            stats.stats_requests += 1;
+                            #[cfg(feature = "stats")]
+                            {
+                                let config = bincode::config::legacy().with_big_endian();
+                                let mut slice = [0u8; 256];
+                                let n = bincode::encode_into_slice(&stats, &mut slice[..], config)
+                                    .unwrap();
+                                let b = &slice[..n];
+                                if main_socket.send_to(&b, from).await.is_err() {
+                                    println!("Error sending the main socket for stats request");
+                                    tokio::time::sleep(Duration::from_millis(5)).await;
+                                }
                             }
                             continue;
                         }
@@ -254,7 +351,10 @@ async fn main() -> anyhow::Result<()> {
             }
 
             if is_keepalive {
+                stats.simple_keepalives += 1;
+                stats.last_ka_s = get_unixtime();
                 if client_address != Some(from) {
+                    stats.simple_address_switches += 1;
                     println!("New client address: {from}");
                     client_address = Some(from)
                 }
@@ -263,6 +363,7 @@ async fn main() -> anyhow::Result<()> {
 
             if Some(from) == client_address {
                 if n < 2 {
+                    stats.dwarfs += 1;
                     println!("Too short datagram from client");
                     continue;
                 }
@@ -272,22 +373,33 @@ async fn main() -> anyhow::Result<()> {
 
                 let Some(&addr) = lru_rev.peek(&channel_id) else {
                     if !inhibit_wrong_channel_message {
+                        stats.ch_not_founds += 1;
                         println!("Failed to find channel {channel_id}");
                     }
                     continue;
                 };
 
+                #[cfg(feature = "stats")]
+                {
+                    stats.from_client_msgs += 1;
+                    stats.from_client_bytes += n as u64 - 2;
+                    stats.last_client_s = get_unixtime();
+                }
+
                 if main_socket.send_to(&buf[4..(n + 2)], addr).await.is_err() {
+                    stats.err3 += 1;
                     println!("Error sending to the main socket to connectee");
                     tokio::time::sleep(Duration::from_millis(5)).await;
                     continue;
                 }
             } else {
                 let Some(client_address) = client_address else {
+                    stats.dropped_no_client_address += 1;
                     continue;
                 };
 
                 let &channel_id = lru.get_or_insert(from, || {
+                    stats.new_connectees += 1;
                     seqn += 1;
                     println!("Connectee seqn {seqn} from {from}");
 
@@ -298,17 +410,53 @@ async fn main() -> anyhow::Result<()> {
 
                 buf[0..2].copy_from_slice(&channel_id.to_be_bytes());
 
+                #[cfg(feature = "stats")]
+                {
+                    stats.from_connectee_msgs += 1;
+                    stats.from_connectee_bytes += n as u64;
+                    stats.last_connectee_s = get_unixtime();
+                }
+
                 if main_socket
                     .send_to(&buf[..(2 + n)], client_address)
                     .await
                     .is_err()
                 {
+                    stats.err4 += 1;
                     println!("Error sending to the main socket to client");
                     tokio::time::sleep(Duration::from_millis(5)).await;
                     continue;
                 }
             }
         }
+    } else if let (Some(server_addr), true) = (server_addr, dump_stats) {
+        #[cfg(all(feature = "signed_keepalives", feature = "stats_display"))]
+        {
+            let msg = signer.unwrap().stats_request();
+
+            if main_socket.connect(server_addr).await.is_err() {
+                anyhow::bail!("Failed to connect the socket to server address");
+            }
+
+            if main_socket.send(&msg).await.is_err() {
+                anyhow::bail!("Failed to send a stats request to server address");
+            }
+
+            let mut buf = [0u8; 256];
+
+            let Ok(n) = main_socket.recv(&mut buf[..]).await else {
+                anyhow::bail!("Failed to receive a replay from server");
+            };
+
+            let b = &buf[..n];
+
+            let config = bincode::config::legacy().with_big_endian();
+            let (msg, _): (Stats, _) = bincode::decode_from_slice(b, config).unwrap();
+
+            serde_json::ser::to_writer(std::io::stdout(), &msg).unwrap();
+        }
+
+        Ok(())
     } else if let (Some(local_connect_addr), Some(server_addr)) = (local_connect_addr, server_addr)
     {
         // Client mode
